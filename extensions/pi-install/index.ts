@@ -2,8 +2,17 @@
  * pi-install — OMP Extension
  *
  * Installs Pi plugins (extensions + skills) from GitHub into OMP.
- * Rewrites runtime imports to use OMP's injected objects (pi.pi, pi.typebox)
- * since OMP is a compiled binary and @oh-my-pi/* packages aren't on disk.
+ *
+ * Pi extensions can't run in OMP as-is because OMP is a compiled Bun binary —
+ * the @oh-my-pi/* and @sinclair/* packages don't exist on disk. This extension
+ * solves that by:
+ *
+ *   1. Bundling multi-file extensions into a single file (via Bun.build)
+ *   2. Rewriting pi package imports to use OMP's injected runtime objects
+ *      (pi.pi for coding-agent/ai/tui exports, pi.typebox for typebox)
+ *   3. Relocating module-scope code that depends on pi symbols into the
+ *      factory function body
+ *   4. Installing third-party npm dependencies
  *
  * Commands:
  *   /pi-install <user/repo | github-url>  — install a Pi plugin
@@ -47,37 +56,99 @@ interface PiManifest {
 	skills?: string[];
 }
 
+type ExecFn = (
+	cmd: string,
+	args: string[],
+	opts?: { timeout?: number; cwd?: string },
+) => Promise<{ code: number; stdout: string; stderr: string }>;
+
+type NotifyFn = (msg: string, level: "info" | "error" | "warning") => void;
+
 // ---------------------------------------------------------------------------
-// Import rewriting — the core value of this extension
-//
-// OMP is a compiled binary. The @oh-my-pi/* and @sinclair/* packages are NOT
-// available on disk for resolution. Extensions must use the injected runtime
-// objects: pi.pi (coding-agent + ai + tui exports), pi.typebox (@sinclair/typebox).
-//
-// Pi extensions import from these packages:
-//   @mariozechner/pi-coding-agent  →  available via pi.pi at runtime
-//   @mariozechner/pi-agent-core    →  available via pi.pi at runtime
-//   @mariozechner/pi-ai            →  mostly pi.pi, but Type → pi.typebox
-//   @mariozechner/pi-tui           →  partially via pi.pi, rest polyfilled
-//   @mariozechner/pi-utils         →  available via pi.pi at runtime
-//   @sinclair/typebox              →  available via pi.typebox at runtime
-//
-// Strategy: rewrite the extension to extract these from the pi object at
-// factory entry, then use local references throughout.
+// Bundling — flatten multi-file extensions into a single file via Bun.build
 // ---------------------------------------------------------------------------
 
+/** Check if a file has relative imports (indicating multi-file extension). */
+function hasRelativeImports(filePath: string): boolean {
+	const code = fs.readFileSync(filePath, "utf-8");
+	// Match import/export from "./..." or "../..."
+	return /(?:import|export)\s+.*from\s+["']\.\.?\//.test(code)
+		|| /require\s*\(\s*["']\.\.?\//.test(code);
+}
+
 /**
- * Polyfills for pi-tui functions not exposed on pi.pi.
- * Injected into extension files that need them.
+ * Bundle a multi-file extension into a single output file using Bun.build.
+ *
+ * - Inlines all relative imports (./foo, ../bar)
+ * - Externalizes everything else (npm packages, node builtins, pi packages)
+ * - Returns the bundled code as a string, or null on failure
  */
+async function bundleExtension(
+	entryFile: string,
+	notify: NotifyFn,
+): Promise<string | null> {
+	const Bun = (globalThis as any).Bun;
+	if (typeof Bun?.build !== "function") {
+		notify("Bun.build not available — cannot bundle multi-file extensions.", "error");
+		return null;
+	}
+
+	try {
+		const result = await Bun.build({
+			entrypoints: [entryFile],
+			target: "bun",
+			format: "esm",
+			// Externalize ALL bare specifiers: npm packages, node builtins, pi packages.
+			// Only relative imports (./foo, ../bar) get bundled.
+			packages: "external",
+		});
+
+		if (!result.success) {
+			const logs = result.logs.map((l: any) => String(l.message ?? l)).join("\n");
+			notify(`Bundle failed:\n${logs}`, "error");
+			return null;
+		}
+
+		return await result.outputs[0].text();
+	} catch (e: any) {
+		notify(`Bundle error: ${e.message}`, "error");
+		return null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Import rewriting — the core transformation
+//
+// OMP's compiled binary injects pi packages via:
+//   pi.pi      — exports from pi-coding-agent + pi-ai + pi-tui + pi-agent-core
+//   pi.typebox — exports from @sinclair/typebox
+//
+// Symbols NOT on pi.pi (pi-tui): truncateToWidth, matchesKey, visibleWidth
+//   → injected as polyfill functions
+//
+// Strategy after bundling:
+//   1. Remap @mariozechner/* scopes → @oh-my-pi/*
+//   2. Collect and remove runtime imports from pi scopes and typebox
+//   3. Relocate ALL module-scope code that isn't a type or an import
+//      into the factory function body
+//   4. Inject pi.pi/pi.typebox destructuring + polyfills at factory top
+// ---------------------------------------------------------------------------
+
+/** Symbols that live on pi.typebox, even when re-exported by pi-ai. */
+const TYPEBOX_SYMBOLS = new Set([
+	"Type", "Kind", "TypeGuard", "TypeRegistry", "TypeBoxError",
+	"TypeClone", "TypeCompiler", "Value", "ValueGuard",
+]);
+
+/** pi-tui functions NOT on pi.pi — need polyfills. */
+const POLYFILL_NAMES = new Set(["truncateToWidth", "matchesKey", "visibleWidth"]);
+
 const TUI_POLYFILLS = `
-// --- pi-install: polyfills for pi-tui functions not in pi.pi ---
-function truncateToWidth(text: string, maxWidth: number): string {
-	// Strip ANSI for width calc, truncate if needed
-	const strip = (s: string) => s.replace(/\\x1b\\[[0-9;]*m/g, "");
+// --- pi-install: polyfills for pi-tui functions not on pi.pi ---
+function truncateToWidth(text, maxWidth) {
+	const strip = (s) => s.replace(/\\x1b\\[[0-9;]*m/g, "");
 	if (strip(text).length <= maxWidth) return text;
-	let visible = 0;
-	let i = 0;
+	let visible = 0, i = 0;
 	while (i < text.length && visible < maxWidth - 1) {
 		if (text[i] === "\\x1b" && text[i+1] === "[") {
 			const end = text.indexOf("m", i);
@@ -87,177 +158,329 @@ function truncateToWidth(text: string, maxWidth: number): string {
 	}
 	return text.slice(0, i) + "\u2026";
 }
-function matchesKey(data: string, key: string): boolean {
-	const MAP: Record<string, string> = {
+function matchesKey(data, key) {
+	const MAP = {
 		"escape": "\\x1b", "up": "\\x1b[A", "down": "\\x1b[B",
 		"right": "\\x1b[C", "left": "\\x1b[D",
 		"pageUp": "\\x1b[5~", "pageDown": "\\x1b[6~",
 	};
 	return data === (MAP[key] ?? key);
 }
-function visibleWidth(text: string): number {
+function visibleWidth(text) {
 	return text.replace(/\\x1b\\[[0-9;]*m/g, "").length;
 }
 // --- end polyfills ---
 `.trim();
 
+/** Scopes that get remapped from Pi upstream to OMP. */
+const SCOPE_REMAP: [string, string][] = [
+	["@mariozechner/pi-coding-agent", "@oh-my-pi/pi-coding-agent"],
+	["@mariozechner/pi-agent-core", "@oh-my-pi/pi-agent-core"],
+	["@mariozechner/pi-ai", "@oh-my-pi/pi-ai"],
+	["@mariozechner/pi-tui", "@oh-my-pi/pi-tui"],
+	["@mariozechner/pi-utils", "@oh-my-pi/pi-utils"],
+];
+
+function isPiOrTypeboxPkg(pkg: string): boolean {
+	return /^@oh-my-pi\//.test(pkg) || pkg === "@sinclair/typebox";
+}
+
 /**
- * Rewrite a Pi extension file so it works in OMP's compiled runtime.
+ * Rewrite a Pi extension file so it runs in OMP's compiled runtime.
  *
- * Transforms:
- *   1. Remap @mariozechner/pi-* → @oh-my-pi/pi-* (type imports survive erasure)
- *   2. Convert runtime imports from @oh-my-pi/* and @sinclair/typebox to use
- *      destructured locals from the injected pi object
- *   3. Inject polyfills for pi-tui functions not on pi.pi
+ * This is the main transformation. It handles:
+ * - Raw source files (export default function name(pi) { ... })
+ * - Bundled output (function name(pi) { ... } export { name as default })
+ * - Named imports, namespace imports, type-only imports
+ * - Module-scope declarations (const, let, var, class, function)
+ * - Class extends imported types
  */
-/** Symbols that live on pi.typebox, not pi.pi — even when re-exported by pi-ai. */
-const TYPEBOX_SYMBOLS = new Set([
-	"Type", "Kind", "TypeGuard", "TypeRegistry", "TypeBoxError",
-	"TypeClone", "TypeCompiler", "Value", "ValueGuard",
-]);
-
-/** pi-tui functions not exposed on pi.pi — need polyfills. */
-const POLYFILL_SYMBOLS = new Set(["truncateToWidth", "matchesKey", "visibleWidth"]);
-
-/** Package scopes rewritten by this tool (after step 1 remap). */
-const PI_SCOPES_RE = /^@oh-my-pi\//;
-const TYPEBOX_SCOPE = "@sinclair/typebox";
-
 function rewriteExtensionFile(filePath: string): boolean {
 	let code = fs.readFileSync(filePath, "utf-8");
 	const original = code;
 
-	// Step 1: Remap scopes (@mariozechner → @oh-my-pi)
-	code = code.replace(/@mariozechner\/pi-coding-agent/g, "@oh-my-pi/pi-coding-agent");
-	code = code.replace(/@mariozechner\/pi-agent-core/g, "@oh-my-pi/pi-agent-core");
-	code = code.replace(/@mariozechner\/pi-ai/g, "@oh-my-pi/pi-ai");
-	code = code.replace(/@mariozechner\/pi-tui/g, "@oh-my-pi/pi-tui");
-	code = code.replace(/@mariozechner\/pi-utils/g, "@oh-my-pi/pi-utils");
+	// ── Step 1: Remap @mariozechner → @oh-my-pi ────────────────────────
+	for (const [from, to] of SCOPE_REMAP) {
+		code = code.replaceAll(from, to);
+	}
 
-	// Step 2: Collect runtime (non-type) imports from pi scopes and typebox,
-	// then remove them and inject destructured locals from the factory arg.
-	//
-	// Handles two patterns:
-	//   import { A, B } from "..."   (named)
-	//   import * as X from "..."     (namespace)
-	const namedImportRe = /^import\s+\{([^}]+)\}\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
-	const namespaceImportRe = /^import\s+\*\s+as\s+(\w+)\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
+	// ── Step 2: Collect and remove runtime imports ─────────────────────
+	// Named: import { A, B } from "..."
+	const namedRe = /^import\s+\{([^}]+)\}\s+from\s+["']([^"']+)["'];?\s*$/gm;
+	// Namespace: import * as X from "..."
+	const nsRe = /^import\s+\*\s+as\s+(\w+)\s+from\s+["']([^"']+)["'];?\s*$/gm;
 
 	const piPiSymbols: string[] = [];
 	const typeboxSymbols: string[] = [];
-	const namespaceBindings: { name: string; target: "pi" | "typebox" }[] = [];
+	const nsBindings: { name: string; target: "pi" | "typebox" }[] = [];
 	let needsPolyfills = false;
 
-	// Process named imports: import { A, B } from "..."
-	code = code.replace(namedImportRe, (_match, imports: string, pkg: string) => {
+	code = code.replace(namedRe, (_m, imports: string, pkg: string) => {
+		if (!isPiOrTypeboxPkg(pkg)) return _m; // not a pi package — keep
 		const names = imports.split(",").map((s: string) => s.trim()).filter(Boolean);
 		for (const n of names) {
-			if (pkg === TYPEBOX_SCOPE || TYPEBOX_SYMBOLS.has(n)) {
-				// Direct typebox import, or re-export from pi-ai (e.g. Type)
+			if (pkg === "@sinclair/typebox" || TYPEBOX_SYMBOLS.has(n)) {
 				typeboxSymbols.push(n);
-			} else if (POLYFILL_SYMBOLS.has(n)) {
+			} else if (POLYFILL_NAMES.has(n)) {
 				needsPolyfills = true;
 			} else {
 				piPiSymbols.push(n);
 			}
 		}
-		return "// [pi-install] removed: " + _match.trim();
+		return "// [pi-install] removed: " + _m.trim();
 	});
 
-	// Process namespace imports: import * as X from "..."
-	code = code.replace(namespaceImportRe, (_match, name: string, pkg: string) => {
-		const target = pkg === TYPEBOX_SCOPE ? "typebox" : "pi";
-		namespaceBindings.push({ name, target });
-		return "// [pi-install] removed: " + _match.trim();
+	code = code.replace(nsRe, (_m, name: string, pkg: string) => {
+		if (!isPiOrTypeboxPkg(pkg)) return _m; // not a pi package — keep
+		nsBindings.push({
+			name,
+			target: pkg === "@sinclair/typebox" ? "typebox" : "pi",
+		});
+		return "// [pi-install] removed: " + _m.trim();
 	});
 
-	if (code === original) return false;
+	if (code === original) return false; // nothing changed
 
-	// Step 3: Move module-level code that depends on removed imports into the factory.
-	// Specifically, find `const X = Type.Something(...)` or similar top-level uses
-	// of symbols we just removed, and relocate them inside the factory.
-	const removedSymbols = new Set([
-		...piPiSymbols, ...typeboxSymbols,
-		...POLYFILL_SYMBOLS,
-		...namespaceBindings.map(b => b.name),
-	]);
+	// ── Step 3: Identify the factory function ──────────────────────────
+	// Two patterns:
+	//   A) export default function name(pi: ExtensionAPI) { ... }
+	//   B) function name(pi) { ... }  export { name as default };  (bundled)
+	const factoryInlineRe = /(export\s+default\s+function\s+\w*\s*\([^)]*\)\s*\{)/;
+	// Matches both single-line and multi-line: export {\n  name as default\n};
+	const factoryExportRe = /export\s*\{\s*(\w+)\s+as\s+default\s*\}\s*;?/s;
 
-	// Find the factory function
-	const factoryRe = /(export\s+default\s+function\s+\w*\s*\([^)]*\)\s*\{)/;
-	const factoryMatch = code.match(factoryRe);
+	let factoryOpener: string | null = null;
+	let factoryName: string | null = null;
 
-	if (factoryMatch) {
-		// Collect top-level declarations that reference removed symbols.
-		// Match multi-line const blocks: `const Name = Symbol.Something({` ... `});`
-		const movedBlocks: string[] = [];
-		const symbolPattern = [...removedSymbols].map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-		if (symbolPattern) {
-			// Match top-level const/let/var that use any removed symbol as a call (e.g. Type.Object(...))
-			// This handles multi-line declarations by tracking brace/paren depth.
-			const lines = code.split("\n");
-			const usageRe = new RegExp(`\\b(${symbolPattern})\\s*[\\.\\(]`);
-			let i = 0;
-			while (i < lines.length) {
-				const line = lines[i];
-				// Only target top-level (not indented) const/let declarations
-				const isTopLevel = /^(const|let|var)\s/.test(line);
-				if (isTopLevel && usageRe.test(line)) {
-					// Find the end of this declaration by tracking parens/braces
-					let depth = 0;
-					let j = i;
-					do {
-						for (const ch of lines[j]) {
-							if (ch === "(" || ch === "{") depth++;
-							if (ch === ")" || ch === "}") depth--;
-						}
-						j++;
-					} while (depth > 0 && j < lines.length);
-					
-					// Move these lines into the factory
-					const block = lines.splice(i, j - i);
-					movedBlocks.push(...block.map(l => "\t" + l));
-					// Don't increment i since splice shifted lines
-					continue;
-				}
-				i++;
-			}
-			code = lines.join("\n");
-		}
-
-		// Re-match factory position (may have shifted due to removed blocks)
-		const factoryMatch2 = code.match(factoryRe);
-		if (factoryMatch2) {
-			const injections: string[] = [];
-			if (piPiSymbols.length > 0) {
-				injections.push(`\tconst { ${piPiSymbols.join(", ")} } = pi.pi as any;`);
-			}
-			if (typeboxSymbols.length > 0) {
-				injections.push(`\tconst { ${typeboxSymbols.join(", ")} } = pi.typebox as any;`);
-			}
-			for (const ns of namespaceBindings) {
-				const source = ns.target === "typebox" ? "pi.typebox" : "pi.pi";
-				injections.push(`\tconst ${ns.name} = ${source} as any;`);
-			}
-			if (needsPolyfills) {
-				injections.push("");
-				injections.push(TUI_POLYFILLS.split("\n").map(l => "\t" + l).join("\n"));
-			}
-			if (movedBlocks.length > 0) {
-				injections.push("");
-				injections.push("\t// [pi-install] relocated from module scope:");
-				injections.push(...movedBlocks);
-			}
-
-			if (injections.length > 0) {
-				code = code.replace(factoryRe, factoryMatch2[1] + "\n" + injections.join("\n"));
+	const inlineMatch = code.match(factoryInlineRe);
+	if (inlineMatch) {
+		factoryOpener = inlineMatch[1];
+	} else {
+		const exportMatch = code.match(factoryExportRe);
+		if (exportMatch) {
+			factoryName = exportMatch[1];
+			const funcRe = new RegExp(
+				`(function\\s+${factoryName}\\s*\\([^)]*\\)\\s*\\{)`,
+			);
+			const funcMatch = code.match(funcRe);
+			if (funcMatch) {
+				factoryOpener = funcMatch[1];
 			}
 		}
 	}
 
-	fs.writeFileSync(filePath, code);
+	if (!factoryOpener) {
+		// No factory found — just write the import-rewritten file.
+		// This handles edge cases where extensions don't use the factory pattern.
+		fs.writeFileSync(filePath, code);
+		return true;
+	}
+
+	// ── Step 4: Relocate module-scope code into the factory ────────────
+	// After bundling, the file has:
+	//   - import/export statements (keep at module scope)
+	//   - interface/type declarations (erased by TS, keep at module scope)
+	//   - Everything else: const, let, var, class, function declarations
+	//     that may depend on pi symbols → relocate into factory body
+	//
+	// Instead of trying to trace dependency chains, we take the safe approach:
+	// move ALL non-import, non-type module-scope statements into the factory.
+	// This guarantees everything has access to pi.pi/pi.typebox symbols.
+
+	const lines = code.split("\n");
+	const keepAtModuleScope: string[] = [];
+	const relocate: string[] = [];
+	let factoryOpenerLineIdx = -1;
+	let factoryExportStartIdx = -1;
+	let factoryExportEndIdx = -1;
+
+	// Find the factory function opener
+	for (let i = 0; i < lines.length; i++) {
+		if (factoryOpenerLineIdx === -1 && lines[i].includes(factoryOpener!.slice(0, 30))) {
+			const joined = lines.slice(i, Math.min(i + 3, lines.length)).join("\n");
+			if (joined.includes(factoryOpener!)) {
+				factoryOpenerLineIdx = i;
+			}
+		}
+	}
+
+	// Find the export { name as default } block (may span 1-3 lines)
+	if (factoryName) {
+		for (let i = 0; i < lines.length; i++) {
+			if (/^\s*export\s*\{/.test(lines[i])) {
+				// Check if this export block contains "name as default"
+				let j = i;
+				let chunk = "";
+				while (j < lines.length) {
+					chunk += lines[j] + "\n";
+					if (lines[j].includes("}")) break;
+					j++;
+				}
+				if (chunk.includes(factoryName + " as default")) {
+					factoryExportStartIdx = i;
+					factoryExportEndIdx = j;
+					break;
+				}
+			}
+		}
+	}
+
+	if (factoryOpenerLineIdx === -1) {
+		// Couldn't find factory line — bail with what we have
+		fs.writeFileSync(filePath, code);
+		return true;
+	}
+
+	// Find the factory's closing brace by tracking depth from the opener
+	let factoryEndLineIdx = factoryOpenerLineIdx;
+	{
+		let depth = 0;
+		for (let i = factoryOpenerLineIdx; i < lines.length; i++) {
+			for (const ch of lines[i]) {
+				if (ch === "{") depth++;
+				if (ch === "}") depth--;
+			}
+			if (depth === 0 && i > factoryOpenerLineIdx) {
+				factoryEndLineIdx = i;
+				break;
+			}
+		}
+	}
+
+	// Extract the factory body lines (between opener and closer)
+	const factoryBodyLines = lines.slice(factoryOpenerLineIdx + 1, factoryEndLineIdx);
+	const factoryCloser = lines[factoryEndLineIdx]; // the closing }
+
+	// Classify each line outside the factory.
+	// Key: multi-line constructs (imports, interfaces, types) must be consumed
+	// as a group — not line-by-line — to avoid splitting their bodies.
+	for (let i = 0; i < lines.length; i++) {
+		// Skip factory lines — handled separately
+		if (i >= factoryOpenerLineIdx && i <= factoryEndLineIdx) continue;
+		// Skip the export { name as default } block (may span multiple lines)
+		if (factoryExportStartIdx !== -1 && i >= factoryExportStartIdx && i <= factoryExportEndIdx) continue;
+
+		const line = lines[i];
+		const trimmed = line.trim();
+
+		// Keep: empty lines, comments, bun header
+		if (
+			trimmed === "" ||
+			trimmed.startsWith("//") ||
+			trimmed.startsWith("/*") ||
+			trimmed.startsWith("*") ||
+			trimmed.startsWith("// @bun")
+		) {
+			keepAtModuleScope.push(line);
+			continue;
+		}
+
+		// Keep: imports, type/interface declarations, export type, declare
+		// These may span multiple lines — consume the full construct.
+		const isKeepStart =
+			/^import\s/.test(trimmed) ||
+			/^export\s+type\s/.test(trimmed) ||
+			/^export\s*\{/.test(trimmed) ||
+			/^interface\s/.test(trimmed) ||
+			/^type\s+\w+/.test(trimmed) ||
+			/^declare\s/.test(trimmed);
+
+		if (isKeepStart) {
+			// Consume the entire multi-line construct by tracking depth
+			let depth = 0;
+			let j = i;
+			do {
+				for (const ch of lines[j]) {
+					if (ch === "(" || ch === "{" || ch === "[") depth++;
+					if (ch === ")" || ch === "}" || ch === "]") depth--;
+				}
+				keepAtModuleScope.push(lines[j]);
+				j++;
+			} while (depth > 0 && j < lines.length);
+			i = j - 1;
+			continue;
+		}
+
+		// Anything else: var, const, let, class, function, standalone expressions
+		// Handle multi-line declarations by tracking brace/paren depth.
+		let depth = 0;
+		let j = i;
+		do {
+			for (const ch of lines[j]) {
+				if (ch === "(" || ch === "{" || ch === "[") depth++;
+				if (ch === ")" || ch === "}" || ch === "]") depth--;
+			}
+			relocate.push("\t" + lines[j]);
+			j++;
+		} while (depth > 0 && j < lines.length);
+		// Skip the lines we consumed
+		i = j - 1;
+	}
+
+	// ── Step 5: Reassemble the file ────────────────────────────────────
+	const injections: string[] = [];
+
+	// Destructuring from pi.pi / pi.typebox
+	if (piPiSymbols.length > 0) {
+		injections.push(`\tconst { ${piPiSymbols.join(", ")} } = pi.pi;`);
+	}
+	if (typeboxSymbols.length > 0) {
+		injections.push(`\tconst { ${typeboxSymbols.join(", ")} } = pi.typebox;`);
+	}
+	for (const ns of nsBindings) {
+		const src = ns.target === "typebox" ? "pi.typebox" : "pi.pi";
+		injections.push(`\tconst ${ns.name} = ${src};`);
+	}
+
+	// Polyfills
+	if (needsPolyfills) {
+		injections.push("");
+		injections.push(TUI_POLYFILLS.split("\n").map((l) => "\t" + l).join("\n"));
+	}
+
+	// Relocated module-scope code
+	if (relocate.length > 0) {
+		injections.push("");
+		injections.push("\t// [pi-install] relocated from module scope:");
+		injections.push(...relocate);
+	}
+
+	// Build final file
+	const output: string[] = [];
+
+	// Module-scope: imports, types, comments
+	output.push(...keepAtModuleScope);
+
+	// Factory opener
+	output.push(factoryOpener!);
+
+	// Injections (destructuring, polyfills, relocated code)
+	if (injections.length > 0) {
+		output.push(...injections.join("\n").split("\n"));
+		output.push("");
+	}
+
+	// Original factory body
+	output.push(...factoryBodyLines);
+
+	// Factory closer
+	output.push(factoryCloser);
+
+	// Re-export (for bundled pattern)
+	if (factoryExportStartIdx !== -1) {
+		for (let i = factoryExportStartIdx; i <= factoryExportEndIdx; i++) {
+			output.push(lines[i]);
+		}
+	}
+
+	// Trailing newline
+	output.push("");
+
+	fs.writeFileSync(filePath, output.join("\n"));
 	return true;
 }
 
+/** Rewrite all source files in a directory tree. */
 function rewriteExtensionDir(dir: string): number {
 	let count = 0;
 	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -272,6 +495,52 @@ function rewriteExtensionDir(dir: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// Dependency installation
+// ---------------------------------------------------------------------------
+
+/**
+ * If the source dir has a package.json with third-party dependencies,
+ * install them in the destination directory.
+ */
+async function installDepsIfNeeded(
+	sourceDir: string,
+	destDir: string,
+	notify: NotifyFn,
+	exec: ExecFn,
+): Promise<void> {
+	const srcPkg = path.join(sourceDir, "package.json");
+	if (!fs.existsSync(srcPkg)) return;
+
+	try {
+		const pkg = JSON.parse(fs.readFileSync(srcPkg, "utf-8"));
+		const allDeps = { ...pkg.dependencies };
+		// Filter out pi-ecosystem packages — handled by the rewriter
+		const thirdParty = Object.keys(allDeps).filter(
+			(d) => !d.startsWith("@mariozechner/") && !d.startsWith("@oh-my-pi/") && !d.startsWith("@sinclair/"),
+		);
+		if (thirdParty.length === 0) return;
+
+		// Write a minimal package.json with only third-party deps
+		const minPkg: Record<string, any> = { dependencies: {} };
+		for (const dep of thirdParty) {
+			minPkg.dependencies[dep] = allDeps[dep];
+		}
+		fs.writeFileSync(path.join(destDir, "package.json"), JSON.stringify(minPkg, null, 2));
+
+		notify(`Installing dependencies: ${thirdParty.join(", ")}...`, "info");
+		const result = await exec("npm", ["install", "--production", "--no-audit", "--no-fund"], {
+			cwd: destDir,
+			timeout: 120_000,
+		});
+		if (result.code !== 0) {
+			notify(`Warning: npm install failed (exit ${result.code}). Extension may not work.`, "warning");
+		}
+	} catch {
+		notify("Warning: could not install dependencies from package.json.", "warning");
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Registry persistence
 // ---------------------------------------------------------------------------
 
@@ -281,7 +550,7 @@ function loadRegistry(): PluginRegistry {
 			return JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf-8"));
 		}
 	} catch {
-		// Corrupted file — start fresh
+		// Corrupted — start fresh
 	}
 	return { plugins: {} };
 }
@@ -292,24 +561,14 @@ function saveRegistry(reg: PluginRegistry): void {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub URL normalization
+// URL helpers
 // ---------------------------------------------------------------------------
 
 function normalizeGitHubUrl(input: string): string | null {
 	const s = input.trim().replace(/\.git$/, "").replace(/\/$/, "");
-
-	// user/repo
-	if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(s)) {
-		return `https://github.com/${s}`;
-	}
-	// github.com/user/repo (no scheme)
-	if (s.startsWith("github.com/")) {
-		return `https://${s}`;
-	}
-	// Full https URL
-	if (/^https?:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/.test(s)) {
-		return s;
-	}
+	if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(s)) return `https://github.com/${s}`;
+	if (s.startsWith("github.com/")) return `https://${s}`;
+	if (/^https?:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/.test(s)) return s;
 	return null;
 }
 
@@ -339,47 +598,24 @@ function rmDir(dir: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Core install logic
+// Core install logic — the pipeline
 // ---------------------------------------------------------------------------
 
 /**
- * If the extension dir has a package.json with dependencies, run bun install.
- * Third-party deps (jsdom, diff, etc.) aren't in the OMP binary, so they must
- * be installed from npm.
+ * Install a plugin from a cloned directory.
+ *
+ * Pipeline for each extension directory:
+ *   1. Copy source to extensions dir
+ *   2. Install third-party npm deps (if any)
+ *   3. Bundle multi-file extensions into a single file (Bun.build)
+ *   4. Rewrite pi imports to use pi.pi/pi.typebox
+ *   5. Relocate module-scope code into factory
  */
-async function installDepsIfNeeded(
-	extDir: string,
-	notify: (msg: string, level: "info" | "error" | "warning") => void,
-	execFn: (cmd: string, args: string[], opts?: { timeout?: number; cwd?: string }) => Promise<{ code: number; stdout: string; stderr: string }>,
-): Promise<void> {
-	const pkgPath = path.join(extDir, "package.json");
-	if (!fs.existsSync(pkgPath)) return;
-	try {
-		const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-		const deps = Object.keys(pkg.dependencies ?? {});
-		if (deps.length === 0) return;
-
-		// Filter out @mariozechner/* and @oh-my-pi/* — those are handled by the rewriter,
-		// not by npm install.
-		const thirdParty = deps.filter(d => !d.startsWith("@mariozechner/") && !d.startsWith("@oh-my-pi/") && !d.startsWith("@sinclair/"));
-		if (thirdParty.length === 0) return;
-
-		notify(`Installing dependencies: ${thirdParty.join(", ")}...`, "info");
-		const result = await execFn("bun", ["install", "--production"], { cwd: extDir, timeout: 60_000 });
-		if (result.code !== 0) {
-			notify(`Warning: dependency install failed (exit ${result.code}). Extension may not work.`, "warning");
-		}
-	} catch {
-		notify("Warning: could not parse package.json for dependency install.", "warning");
-	}
-}
-
-
 async function installFromDir(
 	tmpDir: string,
 	repoName: string,
-	notify: (msg: string, level: "info" | "error" | "warning") => void,
-	execFn: (cmd: string, args: string[], opts?: { timeout?: number; cwd?: string }) => Promise<{ code: number; stdout: string; stderr: string }>,
+	notify: NotifyFn,
+	exec: ExecFn,
 ): Promise<{ name: string; extensions: string[]; skills: string[] } | null> {
 	// Read manifest: omp > pi > fallback to convention
 	const pkgPath = path.join(tmpDir, "package.json");
@@ -424,9 +660,9 @@ async function installFromDir(
 			}
 
 			if (fs.statSync(resolved).isDirectory()) {
-				// Check if this dir IS an extension (has index.ts) or CONTAINS extensions
-				const hasIndex = fs.existsSync(path.join(resolved, "index.ts"))
-					|| fs.existsSync(path.join(resolved, "index.js"));
+				const hasIndex =
+					fs.existsSync(path.join(resolved, "index.ts")) ||
+					fs.existsSync(path.join(resolved, "index.js"));
 
 				if (hasIndex) {
 					// This dir is itself one extension
@@ -434,8 +670,7 @@ async function installFromDir(
 					const dest = path.join(EXTENSIONS_DIR, name);
 					if (fs.existsSync(dest)) rmDir(dest);
 					copyDir(resolved, dest);
-					await installDepsIfNeeded(dest, notify, execFn);
-					rewriteExtensionDir(dest);
+					await processExtensionDir(dest, resolved, name, notify, exec);
 					installedExts.push(name);
 				} else {
 					// Dir contains multiple extensions as subdirs/files
@@ -445,8 +680,7 @@ async function installFromDir(
 							const dest = path.join(EXTENSIONS_DIR, entry.name);
 							if (fs.existsSync(dest)) rmDir(dest);
 							copyDir(src, dest);
-							await installDepsIfNeeded(dest, notify, execFn);
-							rewriteExtensionDir(dest);
+							await processExtensionDir(dest, src, entry.name, notify, exec);
 							installedExts.push(entry.name);
 						} else if (/\.(ts|js)$/.test(entry.name)) {
 							const dest = path.join(EXTENSIONS_DIR, entry.name);
@@ -478,16 +712,13 @@ async function installFromDir(
 				continue;
 			}
 
-			// Check if this dir IS a skill (has SKILL.md) or CONTAINS skills
 			if (fs.existsSync(path.join(resolved, "SKILL.md"))) {
-				// This dir is itself a skill
 				const name = path.basename(resolved);
 				const dest = path.join(SKILLS_DIR, name);
 				if (fs.existsSync(dest)) rmDir(dest);
 				copyDir(resolved, dest);
 				installedSkills.push(name);
 			} else {
-				// Dir contains multiple skills as subdirs
 				for (const entry of fs.readdirSync(resolved, { withFileTypes: true })) {
 					if (!entry.isDirectory()) continue;
 					const src = path.join(resolved, entry.name);
@@ -510,8 +741,47 @@ async function installFromDir(
 	return { name: pkgName, extensions: installedExts, skills: installedSkills };
 }
 
+/**
+ * Process a single extension directory through the full pipeline:
+ * deps → bundle → rewrite.
+ */
+async function processExtensionDir(
+	destDir: string,
+	sourceDir: string,
+	name: string,
+	notify: NotifyFn,
+	exec: ExecFn,
+): Promise<void> {
+	// 1. Install third-party deps
+	await installDepsIfNeeded(sourceDir, destDir, notify, exec);
+
+	// 2. Find the entry file
+	const entryTs = path.join(destDir, "index.ts");
+	const entryJs = path.join(destDir, "index.js");
+	const entryFile = fs.existsSync(entryTs) ? entryTs : entryJs;
+
+	// 3. Bundle if multi-file
+	if (hasRelativeImports(entryFile)) {
+		notify(`Bundling ${name} (multi-file extension)...`, "info");
+		const bundled = await bundleExtension(entryFile, notify);
+		if (bundled) {
+			// Replace all source files with the single bundled output
+			for (const entry of fs.readdirSync(destDir, { withFileTypes: true })) {
+				const p = path.join(destDir, entry.name);
+				if (entry.name === "node_modules" || entry.name === "package.json") continue;
+				if (entry.isDirectory()) rmDir(p);
+				else fs.unlinkSync(p);
+			}
+			fs.writeFileSync(entryFile, bundled);
+		}
+	}
+
+	// 4. Rewrite pi imports
+	rewriteExtensionDir(destDir);
+}
+
 // ---------------------------------------------------------------------------
-// Extension
+// Extension — command handlers
 // ---------------------------------------------------------------------------
 
 export default function piInstallExtension(pi: ExtensionAPI) {
@@ -540,7 +810,10 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 
 			const gitUrl = normalizeGitHubUrl(input);
 			if (!gitUrl) {
-				ctx.ui.notify(`Invalid GitHub reference: ${input}\nExpected: user/repo or https://github.com/user/repo`, "error");
+				ctx.ui.notify(
+					`Invalid GitHub reference: ${input}\nExpected: user/repo or https://github.com/user/repo`,
+					"error",
+				);
 				return;
 			}
 
@@ -550,7 +823,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 			const tmpDir = path.join(os.tmpdir(), `pi-install-${repoName}-${Date.now()}`);
 
 			try {
-				// Clone
 				const clone = await pi.exec("git", ["clone", "--depth", "1", "--single-branch", gitUrl, tmpDir], {
 					timeout: 60_000,
 				});
@@ -561,7 +833,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 					return;
 				}
 
-				// Install
 				const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level), pi.exec.bind(pi));
 				if (!result) return;
 
@@ -576,14 +847,12 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 				};
 				saveRegistry(reg);
 
-				// Report
 				const lines = [`Installed ${result.name}`];
 				if (result.extensions.length) lines.push(`  Extensions: ${result.extensions.join(", ")}`);
 				if (result.skills.length) lines.push(`  Skills: ${result.skills.join(", ")}`);
 				lines.push("", "Run /reload to activate.");
 				ctx.ui.notify(lines.join("\n"), "info");
 			} finally {
-				// Always clean up
 				if (fs.existsSync(tmpDir)) rmDir(tmpDir);
 			}
 		},
@@ -615,7 +884,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 
 			const plugin = reg.plugins[name];
 			if (!plugin) {
-				// Try fuzzy match
 				const match = plugins.find((p) => p.toLowerCase().includes(name.toLowerCase()));
 				if (!match) {
 					ctx.ui.notify(`Plugin "${name}" not found.\nInstalled: ${plugins.join(", ")}`, "error");
@@ -626,7 +894,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 
 			const target = reg.plugins[name]!;
 
-			// Remove extensions
 			for (const ext of target.extensions) {
 				const p = path.join(EXTENSIONS_DIR, ext);
 				if (fs.existsSync(p)) {
@@ -634,7 +901,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			// Remove skills
 			for (const skill of target.skills) {
 				const p = path.join(SKILLS_DIR, skill);
 				if (fs.existsSync(p)) rmDir(p);
@@ -690,7 +956,6 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 
 			let name = (args ?? "").trim();
 
-			// If no name, update all
 			const targets = name
 				? [reg.plugins[name] ?? reg.plugins[plugins.find((p) => p.toLowerCase().includes(name.toLowerCase())) ?? ""]].filter(Boolean)
 				: Object.values(reg.plugins);
@@ -703,8 +968,8 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 			for (const plugin of targets) {
 				ctx.ui.notify(`Updating ${plugin.name} from ${plugin.source}...`, "info");
 
-				const repoName = repoNameFromUrl(plugin.source);
-				const tmpDir = path.join(os.tmpdir(), `pi-install-${repoName}-${Date.now()}`);
+				const rn = repoNameFromUrl(plugin.source);
+				const tmpDir = path.join(os.tmpdir(), `pi-install-${rn}-${Date.now()}`);
 
 				try {
 					const clone = await pi.exec("git", ["clone", "--depth", "1", "--single-branch", plugin.source, tmpDir], {
@@ -716,7 +981,7 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 						continue;
 					}
 
-					// Remove old files first
+					// Remove old files
 					for (const ext of plugin.extensions) {
 						const p = path.join(EXTENSIONS_DIR, ext);
 						if (fs.existsSync(p)) {
@@ -728,8 +993,7 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 						if (fs.existsSync(p)) rmDir(p);
 					}
 
-					// Re-install
-					const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level), pi.exec.bind(pi));
+					const result = await installFromDir(tmpDir, rn, (msg, level) => ctx.ui.notify(msg, level), pi.exec.bind(pi));
 					if (result) {
 						reg.plugins[result.name] = {
 							name: result.name,
