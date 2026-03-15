@@ -1,0 +1,13 @@
+{
+  "name": "omp-pi-install",
+  "version": "1.0.0",
+  "description": "Install Pi plugins in Oh My Pi with automatic import remapping",
+  "keywords": ["omp-package"],
+  "license": "MIT",
+  "omp": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*"
+  }
+}
