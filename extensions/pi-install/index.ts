@@ -1,8 +1,9 @@
 /**
  * pi-install — OMP Extension
  *
- * Installs Pi plugins (extensions + skills) from GitHub into OMP,
- * automatically remapping @mariozechner/pi-* imports to @oh-my-pi/pi-*.
+ * Installs Pi plugins (extensions + skills) from GitHub into OMP.
+ * Rewrites runtime imports to use OMP's injected objects (pi.pi, pi.typebox)
+ * since OMP is a compiled binary and @oh-my-pi/* packages aren't on disk.
  *
  * Commands:
  *   /pi-install <user/repo | github-url>  — install a Pi plugin
@@ -47,38 +48,188 @@ interface PiManifest {
 }
 
 // ---------------------------------------------------------------------------
-// Import remapping — the core value of this extension
+// Import rewriting — the core value of this extension
+//
+// OMP is a compiled binary. The @oh-my-pi/* and @sinclair/* packages are NOT
+// available on disk for resolution. Extensions must use the injected runtime
+// objects: pi.pi (coding-agent + ai + tui exports), pi.typebox (@sinclair/typebox).
+//
+// Pi extensions import from 3 packages:
+//   @mariozechner/pi-coding-agent  →  available via pi.pi at runtime
+//   @mariozechner/pi-ai            →  available via pi.pi at runtime
+//   @mariozechner/pi-tui           →  partially via pi.pi, rest polyfilled
+//   @sinclair/typebox              →  available via pi.typebox at runtime
+//
+// Strategy: rewrite the extension to extract these from the pi object at
+// factory entry, then use local references throughout.
 // ---------------------------------------------------------------------------
 
-const SCOPE_REMAP: [RegExp, string][] = [
-	[/@mariozechner\/pi-coding-agent/g, "@oh-my-pi/pi-coding-agent"],
-	[/@mariozechner\/pi-agent-core/g, "@oh-my-pi/pi-agent-core"],
-	[/@mariozechner\/pi-ai/g, "@oh-my-pi/pi-ai"],
-	[/@mariozechner\/pi-tui/g, "@oh-my-pi/pi-tui"],
-	[/@mariozechner\/pi-utils/g, "@oh-my-pi/pi-utils"],
-];
+/**
+ * Polyfills for pi-tui functions not exposed on pi.pi.
+ * Injected into extension files that need them.
+ */
+const TUI_POLYFILLS = `
+// --- pi-install: polyfills for pi-tui functions not in pi.pi ---
+function truncateToWidth(text: string, maxWidth: number): string {
+	// Strip ANSI for width calc, truncate if needed
+	const strip = (s: string) => s.replace(/\\x1b\\[[0-9;]*m/g, "");
+	if (strip(text).length <= maxWidth) return text;
+	let visible = 0;
+	let i = 0;
+	while (i < text.length && visible < maxWidth - 1) {
+		if (text[i] === "\\x1b" && text[i+1] === "[") {
+			const end = text.indexOf("m", i);
+			if (end !== -1) { i = end + 1; continue; }
+		}
+		visible++; i++;
+	}
+	return text.slice(0, i) + "\u2026";
+}
+function matchesKey(data: string, key: string): boolean {
+	const MAP: Record<string, string> = {
+		"escape": "\\x1b", "up": "\\x1b[A", "down": "\\x1b[B",
+		"right": "\\x1b[C", "left": "\\x1b[D",
+		"pageUp": "\\x1b[5~", "pageDown": "\\x1b[6~",
+	};
+	return data === (MAP[key] ?? key);
+}
+function visibleWidth(text: string): number {
+	return text.replace(/\\x1b\\[[0-9;]*m/g, "").length;
+}
+// --- end polyfills ---
+`.trim();
 
-function remapFileImports(filePath: string): boolean {
-	const content = fs.readFileSync(filePath, "utf-8");
-	let result = content;
-	for (const [pattern, replacement] of SCOPE_REMAP) {
-		result = result.replace(pattern, replacement);
+/**
+ * Rewrite a Pi extension file so it works in OMP's compiled runtime.
+ *
+ * Transforms:
+ *   1. Remap @mariozechner/pi-* → @oh-my-pi/pi-* (type imports survive erasure)
+ *   2. Convert runtime imports from @oh-my-pi/* and @sinclair/typebox to use
+ *      destructured locals from the injected pi object
+ *   3. Inject polyfills for pi-tui functions not on pi.pi
+ */
+function rewriteExtensionFile(filePath: string): boolean {
+	let code = fs.readFileSync(filePath, "utf-8");
+	const original = code;
+
+	// Step 1: Remap scopes (@mariozechner → @oh-my-pi)
+	code = code.replace(/@mariozechner\/pi-coding-agent/g, "@oh-my-pi/pi-coding-agent");
+	code = code.replace(/@mariozechner\/pi-agent-core/g, "@oh-my-pi/pi-agent-core");
+	code = code.replace(/@mariozechner\/pi-ai/g, "@oh-my-pi/pi-ai");
+	code = code.replace(/@mariozechner\/pi-tui/g, "@oh-my-pi/pi-tui");
+	code = code.replace(/@mariozechner\/pi-utils/g, "@oh-my-pi/pi-utils");
+
+	// Step 2: Collect runtime (non-type) imports from @oh-my-pi/* and @sinclair/typebox
+	// then remove them and inject destructured locals from the factory arg.
+	const runtimeImportRe = /^import\s+\{([^}]+)\}\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
+	const piPiSymbols: string[] = [];
+	const typeboxSymbols: string[] = [];
+	let needsPolyfills = false;
+
+	code = code.replace(runtimeImportRe, (_match, imports: string, pkg: string) => {
+		const names = imports.split(",").map((s: string) => s.trim()).filter(Boolean);
+		if (pkg === "@sinclair/typebox") {
+			typeboxSymbols.push(...names);
+		} else {
+			// Check which names need polyfills (not on pi.pi)
+			for (const n of names) {
+				if (["truncateToWidth", "matchesKey", "visibleWidth"].includes(n)) {
+					needsPolyfills = true;
+				} else {
+					piPiSymbols.push(n);
+				}
+			}
+		}
+		return "// [pi-install] removed: " + _match.trim();
+	});
+
+	if (code === original) return false;
+
+	// Step 3: Move module-level code that depends on removed imports into the factory.
+	// Specifically, find `const X = Type.Something(...)` or similar top-level uses
+	// of symbols we just removed, and relocate them inside the factory.
+	const removedSymbols = new Set([...piPiSymbols, ...typeboxSymbols, "truncateToWidth", "matchesKey", "visibleWidth"]);
+
+	// Find the factory function
+	const factoryRe = /(export\s+default\s+function\s+\w*\s*\([^)]*\)\s*\{)/;
+	const factoryMatch = code.match(factoryRe);
+
+	if (factoryMatch) {
+		// Collect top-level declarations that reference removed symbols.
+		// Match multi-line const blocks: `const Name = Symbol.Something({` ... `});`
+		const movedBlocks: string[] = [];
+		const symbolPattern = [...removedSymbols].map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+		if (symbolPattern) {
+			// Match top-level const/let/var that use any removed symbol as a call (e.g. Type.Object(...))
+			// This handles multi-line declarations by tracking brace/paren depth.
+			const lines = code.split("\n");
+			const usageRe = new RegExp(`\\b(${symbolPattern})\\s*[\\.\\(]`);
+			let i = 0;
+			while (i < lines.length) {
+				const line = lines[i];
+				// Only target top-level (not indented) const/let declarations
+				const isTopLevel = /^(const|let|var)\s/.test(line);
+				if (isTopLevel && usageRe.test(line)) {
+					// Find the end of this declaration by tracking parens/braces
+					let depth = 0;
+					let j = i;
+					do {
+						for (const ch of lines[j]) {
+							if (ch === "(" || ch === "{") depth++;
+							if (ch === ")" || ch === "}") depth--;
+						}
+						j++;
+					} while (depth > 0 && j < lines.length);
+					
+					// Move these lines into the factory
+					const block = lines.splice(i, j - i);
+					movedBlocks.push(...block.map(l => "\t" + l));
+					// Don't increment i since splice shifted lines
+					continue;
+				}
+				i++;
+			}
+			code = lines.join("\n");
+		}
+
+		// Re-match factory position (may have shifted due to removed blocks)
+		const factoryMatch2 = code.match(factoryRe);
+		if (factoryMatch2) {
+			const injections: string[] = [];
+			if (piPiSymbols.length > 0) {
+				injections.push(`\tconst { ${piPiSymbols.join(", ")} } = pi.pi as any;`);
+			}
+			if (typeboxSymbols.length > 0) {
+				injections.push(`\tconst { ${typeboxSymbols.join(", ")} } = pi.typebox as any;`);
+			}
+			if (needsPolyfills) {
+				injections.push("");
+				injections.push(TUI_POLYFILLS.split("\n").map(l => "\t" + l).join("\n"));
+			}
+			if (movedBlocks.length > 0) {
+				injections.push("");
+				injections.push("\t// [pi-install] relocated from module scope:");
+				injections.push(...movedBlocks);
+			}
+
+			if (injections.length > 0) {
+				code = code.replace(factoryRe, factoryMatch2[1] + "\n" + injections.join("\n"));
+			}
+		}
 	}
-	if (result !== content) {
-		fs.writeFileSync(filePath, result);
-		return true;
-	}
-	return false;
+
+	fs.writeFileSync(filePath, code);
+	return true;
 }
 
-function remapDirImports(dir: string): number {
+function rewriteExtensionDir(dir: string): number {
 	let count = 0;
 	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
 		const full = path.join(dir, entry.name);
 		if (entry.isDirectory() && entry.name !== "node_modules" && entry.name !== ".git") {
-			count += remapDirImports(full);
+			count += rewriteExtensionDir(full);
 		} else if (entry.isFile() && /\.(ts|js|tsx|jsx|mts|mjs)$/.test(entry.name)) {
-			if (remapFileImports(full)) count++;
+			if (rewriteExtensionFile(full)) count++;
 		}
 	}
 	return count;
@@ -213,7 +364,7 @@ async function installFromDir(
 					const dest = path.join(EXTENSIONS_DIR, name);
 					if (fs.existsSync(dest)) rmDir(dest);
 					copyDir(resolved, dest);
-					remapDirImports(dest);
+					rewriteExtensionDir(dest);
 					installedExts.push(name);
 				} else {
 					// Dir contains multiple extensions as subdirs/files
@@ -223,12 +374,12 @@ async function installFromDir(
 							const dest = path.join(EXTENSIONS_DIR, entry.name);
 							if (fs.existsSync(dest)) rmDir(dest);
 							copyDir(src, dest);
-							remapDirImports(dest);
+							rewriteExtensionDir(dest);
 							installedExts.push(entry.name);
 						} else if (/\.(ts|js)$/.test(entry.name)) {
 							const dest = path.join(EXTENSIONS_DIR, entry.name);
 							fs.copyFileSync(src, dest);
-							remapFileImports(dest);
+							rewriteExtensionFile(dest);
 							installedExts.push(entry.name);
 						}
 					}
@@ -238,7 +389,7 @@ async function installFromDir(
 				const name = path.basename(resolved);
 				const dest = path.join(EXTENSIONS_DIR, name);
 				fs.copyFileSync(resolved, dest);
-				remapFileImports(dest);
+				rewriteExtensionFile(dest);
 				installedExts.push(name);
 			}
 		}
