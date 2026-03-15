@@ -7,10 +7,12 @@ Pi plugins use `@mariozechner/pi-*` imports. OMP uses `@oh-my-pi/pi-*`. This ext
 ## Install
 
 ```bash
-cp -r extensions/pi-install ~/.omp/agent/extensions/
+git clone https://github.com/rayoplateado/omp-pi-install /tmp/omp-pi-install \
+  && cp -r /tmp/omp-pi-install/extensions/pi-install ~/.omp/agent/extensions/ \
+  && rm -rf /tmp/omp-pi-install
 ```
 
-Then `/reload` in OMP.
+Then run `/reload` inside OMP.
 
 ## Usage
 
