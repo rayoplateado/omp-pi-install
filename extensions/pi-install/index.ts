@@ -54,10 +54,12 @@ interface PiManifest {
 // available on disk for resolution. Extensions must use the injected runtime
 // objects: pi.pi (coding-agent + ai + tui exports), pi.typebox (@sinclair/typebox).
 //
-// Pi extensions import from 3 packages:
+// Pi extensions import from these packages:
 //   @mariozechner/pi-coding-agent  →  available via pi.pi at runtime
-//   @mariozechner/pi-ai            →  available via pi.pi at runtime
+//   @mariozechner/pi-agent-core    →  available via pi.pi at runtime
+//   @mariozechner/pi-ai            →  mostly pi.pi, but Type → pi.typebox
 //   @mariozechner/pi-tui           →  partially via pi.pi, rest polyfilled
+//   @mariozechner/pi-utils         →  available via pi.pi at runtime
 //   @sinclair/typebox              →  available via pi.typebox at runtime
 //
 // Strategy: rewrite the extension to extract these from the pi object at
@@ -108,6 +110,19 @@ function visibleWidth(text: string): number {
  *      destructured locals from the injected pi object
  *   3. Inject polyfills for pi-tui functions not on pi.pi
  */
+/** Symbols that live on pi.typebox, not pi.pi — even when re-exported by pi-ai. */
+const TYPEBOX_SYMBOLS = new Set([
+	"Type", "Kind", "TypeGuard", "TypeRegistry", "TypeBoxError",
+	"TypeClone", "TypeCompiler", "Value", "ValueGuard",
+]);
+
+/** pi-tui functions not exposed on pi.pi — need polyfills. */
+const POLYFILL_SYMBOLS = new Set(["truncateToWidth", "matchesKey", "visibleWidth"]);
+
+/** Package scopes rewritten by this tool (after step 1 remap). */
+const PI_SCOPES_RE = /^@oh-my-pi\//;
+const TYPEBOX_SCOPE = "@sinclair/typebox";
+
 function rewriteExtensionFile(filePath: string): boolean {
 	let code = fs.readFileSync(filePath, "utf-8");
 	const original = code;
@@ -119,27 +134,40 @@ function rewriteExtensionFile(filePath: string): boolean {
 	code = code.replace(/@mariozechner\/pi-tui/g, "@oh-my-pi/pi-tui");
 	code = code.replace(/@mariozechner\/pi-utils/g, "@oh-my-pi/pi-utils");
 
-	// Step 2: Collect runtime (non-type) imports from @oh-my-pi/* and @sinclair/typebox
+	// Step 2: Collect runtime (non-type) imports from pi scopes and typebox,
 	// then remove them and inject destructured locals from the factory arg.
-	const runtimeImportRe = /^import\s+\{([^}]+)\}\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
+	//
+	// Handles two patterns:
+	//   import { A, B } from "..."   (named)
+	//   import * as X from "..."     (namespace)
+	const namedImportRe = /^import\s+\{([^}]+)\}\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
+	const namespaceImportRe = /^import\s+\*\s+as\s+(\w+)\s+from\s+["'](@oh-my-pi\/[^"']+|@sinclair\/typebox)["'];?\s*$/gm;
+
 	const piPiSymbols: string[] = [];
 	const typeboxSymbols: string[] = [];
+	const namespaceBindings: { name: string; target: "pi" | "typebox" }[] = [];
 	let needsPolyfills = false;
 
-	code = code.replace(runtimeImportRe, (_match, imports: string, pkg: string) => {
+	// Process named imports: import { A, B } from "..."
+	code = code.replace(namedImportRe, (_match, imports: string, pkg: string) => {
 		const names = imports.split(",").map((s: string) => s.trim()).filter(Boolean);
-		if (pkg === "@sinclair/typebox") {
-			typeboxSymbols.push(...names);
-		} else {
-			// Check which names need polyfills (not on pi.pi)
-			for (const n of names) {
-				if (["truncateToWidth", "matchesKey", "visibleWidth"].includes(n)) {
-					needsPolyfills = true;
-				} else {
-					piPiSymbols.push(n);
-				}
+		for (const n of names) {
+			if (pkg === TYPEBOX_SCOPE || TYPEBOX_SYMBOLS.has(n)) {
+				// Direct typebox import, or re-export from pi-ai (e.g. Type)
+				typeboxSymbols.push(n);
+			} else if (POLYFILL_SYMBOLS.has(n)) {
+				needsPolyfills = true;
+			} else {
+				piPiSymbols.push(n);
 			}
 		}
+		return "// [pi-install] removed: " + _match.trim();
+	});
+
+	// Process namespace imports: import * as X from "..."
+	code = code.replace(namespaceImportRe, (_match, name: string, pkg: string) => {
+		const target = pkg === TYPEBOX_SCOPE ? "typebox" : "pi";
+		namespaceBindings.push({ name, target });
 		return "// [pi-install] removed: " + _match.trim();
 	});
 
@@ -148,7 +176,11 @@ function rewriteExtensionFile(filePath: string): boolean {
 	// Step 3: Move module-level code that depends on removed imports into the factory.
 	// Specifically, find `const X = Type.Something(...)` or similar top-level uses
 	// of symbols we just removed, and relocate them inside the factory.
-	const removedSymbols = new Set([...piPiSymbols, ...typeboxSymbols, "truncateToWidth", "matchesKey", "visibleWidth"]);
+	const removedSymbols = new Set([
+		...piPiSymbols, ...typeboxSymbols,
+		...POLYFILL_SYMBOLS,
+		...namespaceBindings.map(b => b.name),
+	]);
 
 	// Find the factory function
 	const factoryRe = /(export\s+default\s+function\s+\w*\s*\([^)]*\)\s*\{)/;
@@ -201,6 +233,10 @@ function rewriteExtensionFile(filePath: string): boolean {
 			}
 			if (typeboxSymbols.length > 0) {
 				injections.push(`\tconst { ${typeboxSymbols.join(", ")} } = pi.typebox as any;`);
+			}
+			for (const ns of namespaceBindings) {
+				const source = ns.target === "typebox" ? "pi.typebox" : "pi.pi";
+				injections.push(`\tconst ${ns.name} = ${source} as any;`);
 			}
 			if (needsPolyfills) {
 				injections.push("");
@@ -306,10 +342,44 @@ function rmDir(dir: string): void {
 // Core install logic
 // ---------------------------------------------------------------------------
 
+/**
+ * If the extension dir has a package.json with dependencies, run bun install.
+ * Third-party deps (jsdom, diff, etc.) aren't in the OMP binary, so they must
+ * be installed from npm.
+ */
+async function installDepsIfNeeded(
+	extDir: string,
+	notify: (msg: string, level: "info" | "error" | "warning") => void,
+	execFn: (cmd: string, args: string[], opts?: { timeout?: number; cwd?: string }) => Promise<{ code: number; stdout: string; stderr: string }>,
+): Promise<void> {
+	const pkgPath = path.join(extDir, "package.json");
+	if (!fs.existsSync(pkgPath)) return;
+	try {
+		const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+		const deps = Object.keys(pkg.dependencies ?? {});
+		if (deps.length === 0) return;
+
+		// Filter out @mariozechner/* and @oh-my-pi/* — those are handled by the rewriter,
+		// not by npm install.
+		const thirdParty = deps.filter(d => !d.startsWith("@mariozechner/") && !d.startsWith("@oh-my-pi/") && !d.startsWith("@sinclair/"));
+		if (thirdParty.length === 0) return;
+
+		notify(`Installing dependencies: ${thirdParty.join(", ")}...`, "info");
+		const result = await execFn("bun", ["install", "--production"], { cwd: extDir, timeout: 60_000 });
+		if (result.code !== 0) {
+			notify(`Warning: dependency install failed (exit ${result.code}). Extension may not work.`, "warning");
+		}
+	} catch {
+		notify("Warning: could not parse package.json for dependency install.", "warning");
+	}
+}
+
+
 async function installFromDir(
 	tmpDir: string,
 	repoName: string,
 	notify: (msg: string, level: "info" | "error" | "warning") => void,
+	execFn: (cmd: string, args: string[], opts?: { timeout?: number; cwd?: string }) => Promise<{ code: number; stdout: string; stderr: string }>,
 ): Promise<{ name: string; extensions: string[]; skills: string[] } | null> {
 	// Read manifest: omp > pi > fallback to convention
 	const pkgPath = path.join(tmpDir, "package.json");
@@ -364,6 +434,7 @@ async function installFromDir(
 					const dest = path.join(EXTENSIONS_DIR, name);
 					if (fs.existsSync(dest)) rmDir(dest);
 					copyDir(resolved, dest);
+					await installDepsIfNeeded(dest, notify, execFn);
 					rewriteExtensionDir(dest);
 					installedExts.push(name);
 				} else {
@@ -374,6 +445,7 @@ async function installFromDir(
 							const dest = path.join(EXTENSIONS_DIR, entry.name);
 							if (fs.existsSync(dest)) rmDir(dest);
 							copyDir(src, dest);
+							await installDepsIfNeeded(dest, notify, execFn);
 							rewriteExtensionDir(dest);
 							installedExts.push(entry.name);
 						} else if (/\.(ts|js)$/.test(entry.name)) {
@@ -490,7 +562,7 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 				}
 
 				// Install
-				const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level));
+				const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level), pi.exec.bind(pi));
 				if (!result) return;
 
 				// Save to registry
@@ -657,7 +729,7 @@ export default function piInstallExtension(pi: ExtensionAPI) {
 					}
 
 					// Re-install
-					const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level));
+					const result = await installFromDir(tmpDir, repoName, (msg, level) => ctx.ui.notify(msg, level), pi.exec.bind(pi));
 					if (result) {
 						reg.plugins[result.name] = {
 							name: result.name,
