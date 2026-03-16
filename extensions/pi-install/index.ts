@@ -205,29 +205,36 @@ function rewriteExtensionFile(filePath: string): boolean {
 	}
 
 	// ── Step 2: Collect and remove runtime imports ─────────────────────
-	// Named: import { A, B } from "..."
-	const namedRe = /^import\s+\{([^}]+)\}\s+from\s+["']([^"']+)["'];?\s*$/gm;
+	// Handles both single-line and multi-line import { A, B } from "..."
+	// Uses [\s\S]*? to cross newlines in bundled output (Bun splits long imports)
+	const namedImportRe = /import\s+\{([\s\S]*?)\}\s+from\s+["']([^"']+)["'];?/g;
 	// Namespace: import * as X from "..."
 	const nsRe = /^import\s+\*\s+as\s+(\w+)\s+from\s+["']([^"']+)["'];?\s*$/gm;
 
-	const piPiSymbols: string[] = [];
-	const typeboxSymbols: string[] = [];
+	const piPiSet = new Set<string>();
+	const typeboxSet = new Set<string>();
 	const nsBindings: { name: string; target: "pi" | "typebox" }[] = [];
 	let needsPolyfills = false;
 
-	code = code.replace(namedRe, (_m, imports: string, pkg: string) => {
-		if (!isPiOrTypeboxPkg(pkg)) return _m; // not a pi package — keep
+	const classifyImport = (imports: string, pkg: string) => {
 		const names = imports.split(",").map((s: string) => s.trim()).filter(Boolean);
 		for (const n of names) {
+			// Skip type-only imports ("type Foo")
+			if (n.startsWith("type ")) continue;
 			if (pkg === "@sinclair/typebox" || TYPEBOX_SYMBOLS.has(n)) {
-				typeboxSymbols.push(n);
+				typeboxSet.add(n);
 			} else if (POLYFILL_NAMES.has(n)) {
 				needsPolyfills = true;
 			} else {
-				piPiSymbols.push(n);
+				piPiSet.add(n);
 			}
 		}
-		return "// [pi-install] removed: " + _m.trim();
+	};
+
+	code = code.replace(namedImportRe, (_m, imports: string, pkg: string) => {
+		if (!isPiOrTypeboxPkg(pkg)) return _m;
+		classifyImport(imports, pkg);
+		return "// [pi-install] removed: " + _m.trim().replace(/\n/g, " ");
 	});
 
 	code = code.replace(nsRe, (_m, name: string, pkg: string) => {
@@ -421,6 +428,8 @@ function rewriteExtensionFile(filePath: string): boolean {
 	const injections: string[] = [];
 
 	// Destructuring from pi.pi / pi.typebox
+	const piPiSymbols = [...piPiSet];
+	const typeboxSymbols = [...typeboxSet];
 	if (piPiSymbols.length > 0) {
 		injections.push(`\tconst { ${piPiSymbols.join(", ")} } = pi.pi;`);
 	}
